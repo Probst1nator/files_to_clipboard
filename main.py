@@ -125,6 +125,12 @@ class FileCopierApp:
         self.btn_add_folder = ttk.Button(self.tree_controls, text="Add Selected Folder", command=self.add_selected_folder)
         self.btn_add_folder.pack(side=tk.LEFT)
         
+        # Add expand/collapse buttons
+        self.btn_expand_all = ttk.Button(self.tree_controls, text="Expand All", command=self.expand_all_tree_items)
+        self.btn_expand_all.pack(side=tk.LEFT, padx=(5, 0))
+        self.btn_collapse_all = ttk.Button(self.tree_controls, text="Collapse All", command=self.collapse_all_tree_items)
+        self.btn_collapse_all.pack(side=tk.LEFT, padx=(5, 0))
+        
         self.tree = ttk.Treeview(self.tree_frame, show="tree headings")
         self.tree.heading("#0", text="Project Structure", anchor='w')
         
@@ -585,6 +591,51 @@ class FileCopierApp:
             self.listbox.insert(current_index, item)
             self.drag_start_index = current_index
             self.update_preview()
+
+    def expand_all_tree_items(self) -> None:
+        """Expand all tree items recursively."""
+        for item_id in self.tree.get_children():
+            self._expand_tree_item_recursive(item_id)
+
+    def _expand_tree_item_recursive(self, item_id: str) -> None:
+        """Recursively expand a tree item and all its children."""
+        # Get item info
+        item_info = self.tree.item(item_id)
+        
+        # Only expand folders (items with 'folder' tag or items that have children)
+        if 'folder' in item_info.get('tags', []) or self.tree.get_children(item_id):
+            self.tree.item(item_id, open=True)
+            
+            # If this folder has a dummy child, expand it to load actual contents
+            children = self.tree.get_children(item_id)
+            if children and len(children) == 1:
+                dummy_child = children[0]
+                if self.tree.item(dummy_child, "values") == ("dummy",):
+                    # Trigger lazy loading by simulating tree expansion
+                    item_path = item_info.get('values', [''])[0]
+                    if item_path:
+                        full_path = os.path.join(self.directory, item_path)
+                        self.process_directory(item_id, full_path)
+            
+            # Recursively expand all children
+            for child_id in self.tree.get_children(item_id):
+                self._expand_tree_item_recursive(child_id)
+
+    def collapse_all_tree_items(self) -> None:
+        """Collapse all tree items recursively."""
+        for item_id in self.tree.get_children():
+            self._collapse_tree_item_recursive(item_id)
+
+    def _collapse_tree_item_recursive(self, item_id: str) -> None:
+        """Recursively collapse a tree item and all its children."""
+        # First collapse all children
+        for child_id in self.tree.get_children(item_id):
+            self._collapse_tree_item_recursive(child_id)
+        
+        # Then collapse this item if it's a folder
+        item_info = self.tree.item(item_id)
+        if 'folder' in item_info.get('tags', []) or self.tree.get_children(item_id):
+            self.tree.item(item_id, open=False)
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="GUI to select and copy file contents.")
