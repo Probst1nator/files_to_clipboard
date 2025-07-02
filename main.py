@@ -7,6 +7,7 @@ import signal
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, simpledialog
 from typing import Dict, List, Set, Optional, Tuple
+import base64
 
 try:
     import pyperclip
@@ -44,6 +45,15 @@ def is_text_file(filepath: str) -> bool:
             return b'\0' not in chunk
     except (IOError, PermissionError):
         return False
+
+def is_includable_file(filepath: str) -> bool:
+    """
+    Returns True if the file should be included in the selectable list (text or supported binary types).
+    """
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext in {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'}:
+        return True
+    return is_text_file(filepath)
 
 def get_language_hint(filename: str) -> str:
     _, extension = os.path.splitext(filename)
@@ -230,6 +240,9 @@ class FileCopierApp:
         self.drag_start_index: Optional[int] = None
         self._setup_interrupt_handler()
 
+        # Initialize exclusion pattern tracking
+        self._last_exclusion_pattern = self.exclusion_var.get()
+        
         self.load_project_config()
         self._scan_and_cache_all_files()
         self.load_preset_into_ui()
@@ -378,16 +391,31 @@ class FileCopierApp:
                 full_path = os.path.join(root, filename); rel_path = os.path.relpath(full_path, self.directory)
                 normalized_rel_path = rel_path.replace(os.path.sep, '/')
                 if exclusion_regex and exclusion_regex.search(normalized_rel_path): continue
-                if is_text_file(full_path): self.all_text_files.append(rel_path)
+                if is_includable_file(full_path): self.all_text_files.append(rel_path)
         self.all_text_files.sort(key=str.lower)
-        self.status_var.set(f"Ready. Found {len(self.all_text_files)} text files.")
+        self.status_var.set(f"Ready. Found {len(self.all_text_files)} text/binary files.")
 
     def _debounce_search(self, *args):
         if self._search_job: self.root.after_cancel(self._search_job)
         self._search_job = self.root.after(250, self._perform_filter)
 
     def _perform_filter(self, from_preset_load: bool = False):
-        search_term = self.search_var.get().lower(); exclusion_regex = self._get_exclusion_regex()
+        search_term = self.search_var.get().lower()
+        exclusion_regex = self._get_exclusion_regex()
+        
+        # Check if exclusion pattern has changed - if so, we need to rescan files
+        current_exclusion_pattern = self.exclusion_var.get()
+        if not hasattr(self, '_last_exclusion_pattern'):
+            self._last_exclusion_pattern = current_exclusion_pattern
+        elif self._last_exclusion_pattern != current_exclusion_pattern:
+            self._last_exclusion_pattern = current_exclusion_pattern
+            # Exclusion pattern changed, need to rescan to pick up previously excluded files
+            self.status_var.set("Exclusion pattern changed, rescanning files...")
+            self.root.update_idletasks()
+            self._scan_and_cache_all_files()
+            # Update the exclusion_regex after rescanning
+            exclusion_regex = self._get_exclusion_regex()
+        
         filtered_files = [f for f in self.all_text_files if not (exclusion_regex and exclusion_regex.search(f.replace(os.path.sep, '/'))) and not (search_term and search_term not in os.path.basename(f).lower())]
         self.repopulate_tree(filtered_files if search_term or self._get_exclusion_regex() else None)
         if not from_preset_load: self._debounce_auto_save()
@@ -428,7 +456,7 @@ class FileCopierApp:
             if exclusion_regex and exclusion_regex.search(rel_path.replace(os.path.sep, '/')): continue
             if os.path.isdir(full_path):
                 if name not in IGNORE_DIRS and not name.startswith('.'): dirs_to_process.append(name)
-            elif is_text_file(full_path) and not name.startswith('.'): files_to_process.append(name)
+            elif is_includable_file(full_path) and not name.startswith('.'): files_to_process.append(name)
         for dir_name in dirs_to_process:
             rel_path = os.path.relpath(os.path.join(path, dir_name), self.directory); dir_id = self.tree.insert(parent_id, 'end', text=f"📁 {dir_name}", values=[rel_path], tags=('folder',)); self.tree.insert(dir_id, 'end', text='...', values=['dummy'])
         for file_name in files_to_process:
@@ -502,9 +530,16 @@ class FileCopierApp:
                 output_parts.append(f"\n... and {len(selected_files) - i} more file(s) not shown in preview ..."); break
             try:
                 full_path = os.path.join(self.directory, os.path.normpath(rel_path))
-                header, language_hint = f"# {rel_path.replace(os.path.sep, '/')}", get_language_hint(rel_path)
-                with open(full_path, 'r', encoding='utf-8', errors='replace') as f: content = f.read()
-                formatted_block = f"{header}\n```{language_hint}\n{content}\n```"; output_parts.append(formatted_block)
+                ext = os.path.splitext(rel_path)[1].lower()
+                if ext == '.png':
+                    with open(full_path, 'rb') as f:
+                        b64 = base64.b64encode(f.read()).decode('ascii')
+                    formatted_block = f"# {rel_path.replace(os.path.sep, '/')} (base64 PNG)\n```base64\n{b64}\n```"
+                else:
+                    header, language_hint = f"# {rel_path.replace(os.path.sep, '/')}" , get_language_hint(rel_path)
+                    with open(full_path, 'r', encoding='utf-8', errors='replace') as f: content = f.read()
+                    formatted_block = f"{header}\n```{language_hint}\n{content}\n```"
+                output_parts.append(formatted_block)
                 if max_preview_size: total_size += len(formatted_block)
             except Exception as e:
                 error_block = f"# ERROR: Could not read {rel_path}\n```\n{e}\n```"; output_parts.append(error_block)
