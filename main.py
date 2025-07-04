@@ -53,13 +53,13 @@ DARK_TREE_BG = "#2b2b2b"
 
 # --- Vector Database Manager ---
 class VectorDatabaseManager:
-    def __init__(self, directory: str, embedding_model: str = DEFAULT_EMBEDDING_MODEL):
+    def __init__(self, directory: str, db_path: str, embedding_model: str = DEFAULT_EMBEDDING_MODEL):
         self.directory = directory
         self.embedding_model = embedding_model
         self.client = None
         self.collection = None
         self.ollama_available = False
-        self.db_path = os.path.join(directory, VECTOR_DB_PATH)
+        self.db_path = db_path
         
         # Check if ChromaDB is available
         if not CHROMADB_AVAILABLE:
@@ -421,6 +421,7 @@ class FileCopierApp:
         self.directory = os.path.abspath(directory)
         
         self.config_file_path = os.path.join(get_script_directory(), CONFIG_FILENAME)
+        self.vector_db_path = os.path.join(get_script_directory(), VECTOR_DB_PATH)
 
         self.root.title(f"File Content Copier with Vector Search - {os.path.basename(self.directory)}")
         self.root.geometry("1400x900")
@@ -635,7 +636,7 @@ class FileCopierApp:
     def _initialize_vector_db(self):
         """Initialize vector database manager"""
         try:
-            self.vector_db = VectorDatabaseManager(self.directory)
+            self.vector_db = VectorDatabaseManager(self.directory, self.vector_db_path)
             self.vector_search_enabled = True
             if not self.vector_db.ollama_available:
                 self.vector_search_enabled = False
@@ -648,7 +649,7 @@ class FileCopierApp:
             print(f"Vector search disabled: {e}")
             # Try to reinitialize with a simpler approach
             try:
-                self.vector_db = VectorDatabaseManager(self.directory)
+                self.vector_db = VectorDatabaseManager(self.directory, self.vector_db_path)
                 self.vector_search_enabled = True
                 print("Vector database reinitialized successfully")
             except Exception as e2:
@@ -667,7 +668,7 @@ class FileCopierApp:
             # If vector search is not available, try to initialize it again
             if not self.vector_search_enabled:
                 try:
-                    self.vector_db = VectorDatabaseManager(self.directory)
+                    self.vector_db = VectorDatabaseManager(self.directory, self.vector_db_path)
                     self.vector_search_enabled = True
                     if not self.vector_db.ollama_available:
                         self.vector_search_enabled = False
