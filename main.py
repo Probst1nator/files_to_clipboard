@@ -6,13 +6,25 @@ import re
 import signal
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, simpledialog
-from typing import Dict, List, Set, Optional, Tuple
+from typing import Dict, List, Set, Optional, Tuple, Any
 import base64
+import hashlib
+import threading
+import time
+import requests
+from pathlib import Path
 
 try:
     import pyperclip
 except ImportError:
     pyperclip = None
+
+try:
+    import chromadb
+    from chromadb.config import Settings
+    CHROMADB_AVAILABLE = True
+except ImportError:
+    CHROMADB_AVAILABLE = False
 
 # For High-DPI display font rendering on Windows
 try:
@@ -23,9 +35,11 @@ except (ImportError, AttributeError):
 
 # --- Configuration ---
 PRIMARY_PRESET_NAME = "primary"
-# NEW: A single config file stored next to the script.
 CONFIG_FILENAME = ".file_copier_config.json" 
-IGNORE_DIRS: Set[str] = {"__pycache__", "node_modules", "venv", "dist", "build", ".git", ".idea", ".vscode"}
+VECTOR_DB_PATH = ".file_copier_vectordb"
+OLLAMA_BASE_URL = "http://localhost:11434"
+DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
+IGNORE_DIRS: Set[str] = {"__pycache__", "node_modules", "venv", "dist", "build", ".git", ".idea", ".vscode", VECTOR_DB_PATH}
 IGNORE_FILES: Set[str] = {".DS_Store", CONFIG_FILENAME, ".gitignore", ".env"}
 
 # Dark theme colors
@@ -36,6 +50,341 @@ DARK_SELECT_FG = "#ffffff"
 DARK_ENTRY_BG = "#3c3c3c"
 DARK_BUTTON_BG = "#404040"
 DARK_TREE_BG = "#2b2b2b"
+
+# --- Vector Database Manager ---
+class VectorDatabaseManager:
+    def __init__(self, directory: str, embedding_model: str = DEFAULT_EMBEDDING_MODEL):
+        self.directory = directory
+        self.embedding_model = embedding_model
+        self.client = None
+        self.collection = None
+        self.ollama_available = False
+        self.db_path = os.path.join(directory, VECTOR_DB_PATH)
+        
+        # Check if ChromaDB is available
+        if not CHROMADB_AVAILABLE:
+            raise ImportError("ChromaDB is required for vector search. Install with: pip install chromadb")
+        
+        self._initialize_database()
+        self._check_ollama_connection()
+    
+    def _initialize_database(self):
+        """Initialize ChromaDB client and collection"""
+        try:
+            # Ensure the directory exists
+            os.makedirs(self.db_path, exist_ok=True)
+            
+            self.client = chromadb.PersistentClient(path=self.db_path)
+            
+            # Create a valid collection name (ChromaDB has naming restrictions)
+            base_name = hashlib.md5(self.directory.encode()).hexdigest()[:8]
+            collection_name = f"files_{base_name}"
+            
+            # Try to get existing collection first, create only if it doesn't exist
+            try:
+                self.collection = self.client.get_collection(name=collection_name)
+                print(f"Found existing collection: {collection_name}")
+            except Exception as get_error:
+                # Collection doesn't exist, try to create it
+                try:
+                    self.collection = self.client.create_collection(name=collection_name)
+                    print(f"Created new collection: {collection_name}")
+                except Exception as create_error:
+                    # If creation fails because it exists, try to get it again
+                    if "already exists" in str(create_error).lower():
+                        try:
+                            self.collection = self.client.get_collection(name=collection_name)
+                            print(f"Retrieved existing collection after creation conflict: {collection_name}")
+                        except Exception as final_error:
+                            raise RuntimeError(f"Failed to get collection after creation conflict: {final_error}")
+                    else:
+                        raise RuntimeError(f"Failed to create collection: {create_error}")
+                
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize vector database: {e}")
+    
+    def _check_ollama_connection(self):
+        """Check if Ollama is running and the embedding model is available"""
+        try:
+            # Check if Ollama is running
+            response = requests.get(f"{OLLAMA_BASE_URL}/api/version", timeout=5)
+            if response.status_code == 200:
+                self.ollama_available = True
+                
+                # Try to pull the embedding model if it doesn't exist
+                self._ensure_model_available()
+            else:
+                self.ollama_available = False
+        except requests.exceptions.RequestException:
+            self.ollama_available = False
+    
+    def _ensure_model_available(self):
+        """Ensure the embedding model is available in Ollama"""
+        try:
+            # Check if model exists
+            response = requests.post(f"{OLLAMA_BASE_URL}/api/embed", 
+                                   json={"model": self.embedding_model, "input": "test"}, 
+                                   timeout=10)
+            
+            if response.status_code != 200:
+                # Try to pull the model
+                pull_response = requests.post(f"{OLLAMA_BASE_URL}/api/pull", 
+                                            json={"model": self.embedding_model}, 
+                                            timeout=120)
+                if pull_response.status_code != 200:
+                    self.ollama_available = False
+        except requests.exceptions.RequestException:
+            self.ollama_available = False
+    
+    def generate_embedding(self, text: str) -> Optional[List[float]]:
+        """Generate embedding for text using Ollama"""
+        if not self.ollama_available:
+            return None
+        
+        try:
+            response = requests.post(f"{OLLAMA_BASE_URL}/api/embed", 
+                                   json={"model": self.embedding_model, "input": text}, 
+                                   timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                embeddings = data.get("embeddings", [])
+                if embeddings and len(embeddings) > 0:
+                    return embeddings[0]
+        except requests.exceptions.RequestException as e:
+            print(f"Error generating embedding: {e}")
+        
+        return None
+    
+    def add_file_to_index(self, file_path: str, content: str, metadata: Dict[str, Any]):
+        """Add a file's content to the vector index"""
+        if not self.collection:
+            return False
+        
+        try:
+            # Generate a unique ID for the file
+            file_id = hashlib.md5(file_path.encode()).hexdigest()
+            
+            # Generate embedding
+            embedding = self.generate_embedding(content)
+            if embedding is None:
+                return False
+            
+            # Add to collection
+            self.collection.upsert(
+                ids=[file_id],
+                embeddings=[embedding],
+                documents=[content],
+                metadatas=[metadata]
+            )
+            return True
+        except Exception as e:
+            print(f"Error adding file to index: {e}")
+            return False
+    
+    def get_indexed_files(self) -> Dict[str, float]:
+        """Get a mapping of indexed file paths to their last indexed timestamps"""
+        if not self.collection:
+            return {}
+        
+        try:
+            # Get all documents and their metadata
+            results = self.collection.get(include=['metadatas'])
+            indexed_files = {}
+            
+            if results['metadatas']:
+                for metadata in results['metadatas']:
+                    if metadata and 'file_path' in metadata:
+                        file_path = metadata['file_path']
+                        indexed_at = metadata.get('indexed_at', 0)
+                        indexed_files[file_path] = indexed_at
+            
+            return indexed_files
+        except Exception as e:
+            print(f"Error getting indexed files: {e}")
+            return {}
+    
+    def get_files_to_index(self, all_files: List[str]) -> Tuple[List[str], List[str]]:
+        """Get list of files that need to be indexed and files that need to be removed"""
+        indexed_files = self.get_indexed_files()
+        files_to_index = []
+        files_to_remove = []
+        
+        # Find files that need indexing (new or modified)
+        for file_path in all_files:
+            full_path = os.path.join(self.directory, os.path.normpath(file_path))
+            
+            try:
+                # Skip if file doesn't exist or is binary
+                if not os.path.exists(full_path):
+                    continue
+                
+                ext = os.path.splitext(file_path)[1].lower()
+                if ext in {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'}:
+                    continue
+                
+                # Get file modification time
+                file_mtime = os.path.getmtime(full_path)
+                
+                # Check if file needs indexing
+                if file_path not in indexed_files:
+                    # File not indexed yet
+                    files_to_index.append(file_path)
+                elif file_mtime > indexed_files[file_path]:
+                    # File modified since last indexing
+                    files_to_index.append(file_path)
+                    
+            except Exception as e:
+                print(f"Error checking file {file_path}: {e}")
+                continue
+        
+        # Find files that need to be removed (indexed but no longer exist)
+        current_files_set = set(all_files)
+        for indexed_file in indexed_files.keys():
+            if indexed_file not in current_files_set:
+                full_path = os.path.join(self.directory, os.path.normpath(indexed_file))
+                if not os.path.exists(full_path):
+                    files_to_remove.append(indexed_file)
+        
+        return files_to_index, files_to_remove
+    
+    def remove_file_from_index(self, file_path: str) -> bool:
+        """Remove a file from the vector index"""
+        if not self.collection:
+            return False
+        
+        try:
+            file_id = hashlib.md5(file_path.encode()).hexdigest()
+            self.collection.delete(ids=[file_id])
+            return True
+        except Exception as e:
+            print(f"Error removing file from index: {e}")
+            return False
+    
+    def search_similar_files(self, query: str, n_results: int = 50) -> List[Dict[str, Any]]:
+        """Search for files similar to the query"""
+        if not self.collection or not self.ollama_available:
+            return []
+        
+        try:
+            # Generate embedding for query
+            query_embedding = self.generate_embedding(query)
+            if query_embedding is None:
+                return []
+            
+            # Search in collection
+            results = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=n_results
+            )
+            
+            # Format results
+            formatted_results = []
+            if results["ids"] and len(results["ids"]) > 0:
+                for i in range(len(results["ids"][0])):
+                    formatted_results.append({
+                        "file_path": results["metadatas"][0][i]["file_path"],
+                        "content": results["documents"][0][i],
+                        "distance": results["distances"][0][i] if results["distances"] else 0,
+                        "metadata": results["metadatas"][0][i]
+                    })
+            
+            return formatted_results
+        except Exception as e:
+            print(f"Error searching similar files: {e}")
+            return []
+    
+    def auto_index_files(self, all_files: List[str], progress_callback=None, completion_callback=None):
+        """Automatically maintain index - add new/modified files, remove deleted files"""
+        def index_worker():
+            try:
+                files_to_index, files_to_remove = self.get_files_to_index(all_files)
+                
+                total_operations = len(files_to_index) + len(files_to_remove)
+                if total_operations == 0:
+                    if completion_callback:
+                        completion_callback(0, 0, 0, 0)
+                    return
+                
+                indexed_count = 0
+                removed_count = 0
+                checkpoint_interval = max(1, total_operations // 10)  # Checkpoint every 10%
+                operation_count = 0
+                
+                # Remove deleted files first
+                for file_path in files_to_remove:
+                    if self.remove_file_from_index(file_path):
+                        removed_count += 1
+                    
+                    operation_count += 1
+                    if operation_count % checkpoint_interval == 0:
+                        if progress_callback:
+                            progress_callback(operation_count, total_operations, "removing deleted files")
+                        time.sleep(0.05)  # Small delay for UI updates
+                
+                # Index new/modified files
+                for i, file_path in enumerate(files_to_index):
+                    full_path = os.path.join(self.directory, os.path.normpath(file_path))
+                    
+                    try:
+                        with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                            content = f.read()
+                            
+                        if content.strip():  # Only index non-empty files
+                            metadata = {
+                                "file_path": file_path,
+                                "file_name": os.path.basename(file_path),
+                                "file_ext": os.path.splitext(file_path)[1],
+                                "indexed_at": time.time(),
+                                "file_size": len(content),
+                                "file_mtime": os.path.getmtime(full_path)
+                            }
+                            
+                            if self.add_file_to_index(file_path, content, metadata):
+                                indexed_count += 1
+                    
+                    except Exception as e:
+                        print(f"Error indexing {file_path}: {e}")
+                        continue
+                    
+                    operation_count += 1
+                    # Checkpoint progress periodically
+                    if operation_count % checkpoint_interval == 0:
+                        if progress_callback:
+                            progress_callback(operation_count, total_operations, "indexing files")
+                        time.sleep(0.05)  # Small delay for UI updates
+                    
+                    # Update progress
+                    elif progress_callback:
+                        progress_callback(operation_count, total_operations, "indexing")
+                
+                if completion_callback:
+                    completion_callback(indexed_count, len(files_to_index), removed_count, len(files_to_remove))
+                    
+            except Exception as e:
+                print(f"Error in auto indexing: {e}")
+                if completion_callback:
+                    completion_callback(0, 0, 0, 0)
+        
+        # Start indexing in background thread
+        thread = threading.Thread(target=index_worker, daemon=True)
+        thread.start()
+        return thread
+    
+    def get_index_stats(self) -> Dict[str, Any]:
+        """Get statistics about the vector index"""
+        if not self.collection:
+            return {"indexed_files": 0, "ollama_available": False}
+        
+        try:
+            count = self.collection.count()
+            return {
+                "indexed_files": count,
+                "ollama_available": self.ollama_available,
+                "embedding_model": self.embedding_model
+            }
+        except Exception:
+            return {"indexed_files": 0, "ollama_available": self.ollama_available}
 
 # --- Helper Functions ---
 def is_text_file(filepath: str) -> bool:
@@ -61,25 +410,30 @@ def get_language_hint(filename: str) -> str:
 
 def get_script_directory() -> str:
     try:
-        # Favour the actual script location
         script_path = os.path.abspath(__file__)
         return os.path.dirname(script_path)
     except NameError:
-        # Fallback for environments where __file__ is not defined (e.g. some frozen apps)
         return os.getcwd()
-
 
 class FileCopierApp:
     def __init__(self, root: tk.Tk, directory: str):
         self.root = root
         self.directory = os.path.abspath(directory)
         
-        # CHANGED: The config file path is now relative to the script's location.
         self.config_file_path = os.path.join(get_script_directory(), CONFIG_FILENAME)
 
-        self.root.title(f"File Content Copier - {os.path.basename(self.directory)}")
-        self.root.geometry("1200x850")
+        self.root.title(f"File Content Copier with Vector Search - {os.path.basename(self.directory)}")
+        self.root.geometry("1400x900")
         self.root.configure(bg=DARK_BG)
+
+        # Initialize vector database manager
+        self.vector_db = None
+        self.vector_search_enabled = False
+        self.vector_search_mode = False
+        self.search_results = []
+        self.indexing_thread = None
+        self.is_indexing = False
+        self._initialize_vector_db()
 
         # --- Style Configuration ---
         style = ttk.Style()
@@ -105,17 +459,19 @@ class FileCopierApp:
         style.configure("Vertical.TScrollbar", background=DARK_BG, troughcolor=DARK_ENTRY_BG)
         style.configure("Horizontal.TScrollbar", background=DARK_BG, troughcolor=DARK_ENTRY_BG)
         style.configure("TPanedwindow", background=DARK_BG)
+        style.configure("TCheckbutton", background=DARK_BG, foreground=DARK_FG, focuscolor='none')
+        style.map("TCheckbutton", background=[('active', DARK_BG)])
         
         self.selected_files_map: Dict[str, bool] = {}
         self.preview_visible = False
-        self.all_text_files: List[str] = [] # Cache for all project files
+        self.all_text_files: List[str] = []
         self._search_job: Optional[str] = None
         self._auto_save_job: Optional[str] = None
         
-        # NEW: State management variables
-        self.full_config: Dict[str, Dict] = {} # Holds data for all projects
-        self.project_data: Dict[str, any] = {} # Holds data for the current project
-        self.presets: Dict[str, Dict] = {}     # A direct reference to the presets within project_data
+        # State management variables
+        self.full_config: Dict[str, Dict] = {}
+        self.project_data: Dict[str, any] = {}
+        self.presets: Dict[str, Dict] = {}
 
         # Main container
         self.main_container = ttk.Frame(root, padding=10)
@@ -127,13 +483,37 @@ class FileCopierApp:
         # --- Left Pane: File Tree ---
         self.tree_frame = ttk.Frame(self.main_pane, padding=(0,0,5,0))
         
+        # Search/Filter frame with toggle
         self.search_frame = ttk.Frame(self.tree_frame)
         self.search_frame.pack(fill=tk.X, pady=(0, 5))
-        ttk.Label(self.search_frame, text="Filter:").pack(side=tk.LEFT, padx=(0,5))
+        
+        self.search_label = ttk.Label(self.search_frame, text="Filter:")
+        self.search_label.pack(side=tk.LEFT, padx=(0,5))
+        
         self.search_var = tk.StringVar()
         self.search_entry = ttk.Entry(self.search_frame, textvariable=self.search_var)
-        self.search_entry.pack(fill=tk.X, expand=True, ipady=3)
+        self.search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3, padx=(0, 5))
         self.search_var.trace_add("write", self._debounce_search)
+        self.search_entry.bind("<Return>", self._on_search_enter)
+        
+        # Vector search toggle
+        self.vector_toggle_var = tk.BooleanVar()
+        self.vector_toggle = ttk.Checkbutton(
+            self.search_frame, 
+            text="Vector", 
+            variable=self.vector_toggle_var,
+            command=self._on_vector_toggle
+        )
+        self.vector_toggle.pack(side=tk.RIGHT, padx=(5, 0))
+        
+        # Vector controls frame (initially hidden)
+        self.vector_controls_frame = ttk.Frame(self.tree_frame)
+        
+        self.vector_status_var = tk.StringVar()
+        self.vector_status_label = ttk.Label(self.vector_controls_frame, 
+                                           textvariable=self.vector_status_var, 
+                                           foreground="#aaaaaa", font=("Segoe UI", 9))
+        self.vector_status_label.pack(fill=tk.X, pady=(0, 5))
         
         self.exclusion_frame = ttk.Frame(self.tree_frame)
         self.exclusion_frame.pack(fill=tk.X, pady=(0, 10))
@@ -176,11 +556,11 @@ class FileCopierApp:
         self.btn_remove_preset = ttk.Button(self.preset_frame, text="Remove", command=self.remove_selected_preset, width=8)
         self.btn_remove_preset.pack(side=tk.LEFT, padx=(5, 0))
 
-        ttk.Label(self.selection_frame, text="Selected Files (Drag to Reorder)", font=(base_font[0], base_font[1], "bold")).pack(pady=(0, 5), anchor='w')
+        ttk.Label(self.selection_frame, text="Selected Files (Drag to Reorder)", font=("Segoe UI", 10, "bold")).pack(pady=(0, 5), anchor='w')
         self.listbox_frame = ttk.Frame(self.selection_frame)
         self.listbox_frame.pack(fill=tk.BOTH, expand=True)
         
-        self.listbox = tk.Listbox(self.listbox_frame, selectmode=tk.SINGLE, borderwidth=0, relief="flat", bg=DARK_TREE_BG, fg=DARK_FG, selectbackground=DARK_SELECT_BG, selectforeground=DARK_SELECT_FG, font=base_font, highlightthickness=0)
+        self.listbox = tk.Listbox(self.listbox_frame, selectmode=tk.SINGLE, borderwidth=0, relief="flat", bg=DARK_TREE_BG, fg=DARK_FG, selectbackground=DARK_SELECT_BG, selectforeground=DARK_SELECT_FG, font=("Segoe UI", 10), highlightthickness=0)
         listbox_scrollbar = ttk.Scrollbar(self.listbox_frame, orient='vertical', command=self.listbox.yview)
         self.listbox.configure(yscrollcommand=listbox_scrollbar.set)
         self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -246,8 +626,272 @@ class FileCopierApp:
         self.load_project_config()
         self._scan_and_cache_all_files()
         self.load_preset_into_ui()
+        self._update_vector_status()
+        
+        # Start background indexing immediately if vector search is available
+        if self.vector_search_enabled:
+            self.root.after(1000, self._start_continuous_indexing)  # Small delay to let UI settle
 
-    # --- Config and Preset Management ---
+    def _initialize_vector_db(self):
+        """Initialize vector database manager"""
+        try:
+            self.vector_db = VectorDatabaseManager(self.directory)
+            self.vector_search_enabled = True
+            if not self.vector_db.ollama_available:
+                self.vector_search_enabled = False
+                print(f"Vector search partially available: Ollama not running at {OLLAMA_BASE_URL}")
+        except ImportError as e:
+            self.vector_search_enabled = False
+            print(f"Vector search disabled: {e}")
+        except RuntimeError as e:
+            self.vector_search_enabled = False
+            print(f"Vector search disabled: {e}")
+            # Try to reinitialize with a simpler approach
+            try:
+                self.vector_db = VectorDatabaseManager(self.directory)
+                self.vector_search_enabled = True
+                print("Vector database reinitialized successfully")
+            except Exception as e2:
+                print(f"Vector database reinitialization also failed: {e2}")
+        except Exception as e:
+            self.vector_search_enabled = False
+            print(f"Vector search disabled due to unexpected error: {e}")
+
+    def _on_vector_toggle(self):
+        """Handle vector search toggle"""
+        self.vector_search_mode = self.vector_toggle_var.get()
+        
+        if self.vector_search_mode:
+            self.search_label.configure(text="Search:")
+            
+            # If vector search is not available, try to initialize it again
+            if not self.vector_search_enabled:
+                try:
+                    self.vector_db = VectorDatabaseManager(self.directory)
+                    self.vector_search_enabled = True
+                    if not self.vector_db.ollama_available:
+                        self.vector_search_enabled = False
+                except Exception as e:
+                    self.vector_search_enabled = False
+            
+            # Show vector controls or error
+            if self.vector_search_enabled:
+                self.vector_controls_frame.pack(fill=tk.X, pady=(0, 10), after=self.search_frame)
+                self._update_vector_status()
+                # Start continuous indexing if not already running
+                if not self.is_indexing:
+                    self.root.after(500, self._start_continuous_indexing)
+            else:
+                # Show error and revert toggle
+                self.vector_toggle_var.set(False)
+                self.vector_search_mode = False
+                self.search_label.configure(text="Filter:")
+                
+                if not CHROMADB_AVAILABLE:
+                    messagebox.showerror("Vector Search", "Vector search requires ChromaDB.\nInstall with: pip install chromadb")
+                elif self.vector_db and not self.vector_db.ollama_available:
+                    messagebox.showerror("Vector Search", f"Vector search requires Ollama running at {OLLAMA_BASE_URL}\n\nMake sure Ollama is installed and running:\n• Download from ollama.ai\n• Start with 'ollama serve'")
+                else:
+                    messagebox.showerror("Vector Search", "Vector search initialization failed.\nCheck the console for details.")
+                return
+        else:
+            self.search_label.configure(text="Filter:")
+            self.vector_controls_frame.pack_forget()
+        
+        # Clear current search/filter and refresh
+        current_text = self.search_var.get()
+        if current_text:
+            self._perform_filter_or_search()
+
+    def _start_continuous_indexing(self):
+        """Start continuous background indexing that maintains the vector database"""
+        if not self.vector_search_enabled or self.is_indexing:
+            return
+        
+        self.is_indexing = True
+        
+        def progress_callback(current, total, phase="indexing"):
+            if phase == "checkpointing":
+                status = f"Maintaining index: {current}/{total} (checkpointing...)"
+            elif phase == "removing deleted files":
+                status = f"Cleaning index: {current}/{total} (removing deleted files)"
+            else:
+                progress = int((current / total) * 100) if total > 0 else 100
+                status = f"Updating index: {current}/{total} ({progress}%)"
+            
+            # Update UI in main thread
+            self.root.after(0, lambda: self.status_var.set(status))
+        
+        def completion_callback(indexed_count, total_to_index, removed_count, total_to_remove):
+            self.is_indexing = False
+            
+            # Create status message
+            operations = []
+            if indexed_count > 0:
+                operations.append(f"indexed {indexed_count} files")
+            if removed_count > 0:
+                operations.append(f"removed {removed_count} files")
+            
+            if operations:
+                status = f"✅ Index updated: {', '.join(operations)}"
+            elif total_to_index == 0 and total_to_remove == 0:
+                status = "✅ Index up to date"
+            else:
+                status = "⚠️ Index update completed with some errors"
+            
+            # Update UI in main thread and schedule next check
+            self.root.after(0, lambda: [
+                self.status_var.set(status),
+                self._update_vector_status(),
+                # Schedule next indexing check in 30 seconds
+                self.root.after(30000, self._start_continuous_indexing)
+            ])
+        
+        # Start indexing thread
+        self.indexing_thread = self.vector_db.auto_index_files(
+            self.all_text_files, 
+            progress_callback, 
+            completion_callback
+        )
+
+    def _on_search_enter(self, event):
+        """Handle Enter key in search box"""
+        if self.vector_search_mode:
+            self._perform_vector_search()
+        # For filter mode, the debounced search will handle it
+
+    def _update_vector_status(self):
+        """Update the vector search status"""
+        if not self.vector_search_enabled:
+            if not CHROMADB_AVAILABLE:
+                status_text = "ChromaDB not installed (pip install chromadb)"
+            elif self.vector_db and not self.vector_db.ollama_available:
+                status_text = f"Ollama not available at {OLLAMA_BASE_URL}"
+            else:
+                status_text = "Vector search unavailable"
+            
+            self.vector_status_var.set(status_text)
+        else:
+            stats = self.vector_db.get_index_stats()
+            indexed_count = stats.get("indexed_files", 0)
+            model = stats.get("embedding_model", "unknown")
+            
+            if self.is_indexing:
+                status_text = f"Maintaining index... ({indexed_count} files indexed using {model})"
+            else:
+                status_text = f"Index ready: {indexed_count} files using {model}"
+                
+            self.vector_status_var.set(status_text)
+
+    def clear_index(self):
+        """Clear the vector index"""
+        if not self.vector_search_enabled:
+            return
+        
+        if messagebox.askyesno("Confirm Clear", "Are you sure you want to clear the vector index?"):
+            # Stop any ongoing indexing
+            self._stop_auto_indexing()
+            
+            if self.vector_db.clear_index():
+                self.status_var.set("Vector index cleared")
+                self._update_vector_status()
+                # Restart indexing if in vector mode
+                if self.vector_search_mode:
+                    self.root.after(1000, self._start_auto_indexing)  # Small delay
+                # Refresh current view if in vector search mode
+                if self.vector_search_mode:
+                    self._perform_vector_search()
+            else:
+                self.status_var.set("Error clearing vector index")
+
+    def _perform_vector_search(self):
+        """Perform semantic search using vector database"""
+        if not self.vector_search_enabled or not self.vector_search_mode:
+            return
+        
+        query = self.search_var.get().strip()
+        if not query:
+            # Clear tree and show empty message
+            for item in self.tree.get_children(): 
+                self.tree.delete(item)
+            self.tree.insert("", "end", text="Enter a search query above", tags=('info',))
+            self.tree.tag_configure('info', foreground='#888888')
+            return
+        
+        self.status_var.set("Performing semantic search...")
+        
+        def search_worker():
+            results = self.vector_db.search_similar_files(query, n_results=50)
+            
+            def update_ui():
+                self.search_results = results
+                self._display_search_results(results)
+                self.status_var.set(f"Found {len(results)} semantically similar files")
+            
+            self.root.after(0, update_ui)
+        
+        # Run search in background thread
+        thread = threading.Thread(target=search_worker, daemon=True)
+        thread.start()
+
+    def _display_search_results(self, results: List[Dict[str, Any]]):
+        """Display search results in the tree view"""
+        # Clear tree
+        for item in self.tree.get_children(): 
+            self.tree.delete(item)
+        
+        if not results:
+            self.tree.insert("", "end", text="No similar files found", tags=('info',))
+            self.tree.tag_configure('info', foreground='#888888')
+            return
+        
+        # Group results by directory for better visualization
+        nodes = {"": ""}
+        
+        for result in results:
+            file_path = result["file_path"]
+            distance = result.get("distance", 0)
+            similarity = 1 - distance
+            
+            # Create directory structure
+            path_parts = file_path.split(os.path.sep)
+            parent_path = ""
+            
+            for i, part in enumerate(path_parts[:-1]):
+                current_path = os.path.join(*path_parts[:i+1])
+                if current_path not in nodes:
+                    parent_node_id = nodes.get(parent_path, "")
+                    dir_id = self.tree.insert(parent_node_id, 'end', 
+                                            text=f"📁 {part}", 
+                                            values=[current_path], 
+                                            tags=('folder',), 
+                                            open=True)
+                    nodes[current_path] = dir_id
+                parent_path = current_path
+            
+            # Add file with similarity score
+            file_display = f"📄 {path_parts[-1]} (similarity: {similarity:.3f})"
+            self.tree.insert(nodes.get(parent_path, ""), 'end', 
+                           text=file_display, 
+                           values=[file_path], 
+                           tags=('file',))
+        
+        self.tree.tag_configure('file', foreground='#87CEEB')
+        self.tree.tag_configure('folder', foreground='#DDA0DD')
+
+    def _debounce_search(self, *args):
+        if self._search_job: 
+            self.root.after_cancel(self._search_job)
+        self._search_job = self.root.after(250, self._perform_filter_or_search)
+
+    def _perform_filter_or_search(self):
+        """Perform either traditional filtering or vector search based on mode"""
+        if self.vector_search_mode:
+            self._perform_vector_search()
+        else:
+            self._perform_filter(from_preset_load=False)
+
+    # --- Config and Preset Management (unchanged) ---
     def load_project_config(self):
         """Loads the single config file and isolates the data for the current project."""
         try:
@@ -259,7 +903,6 @@ class FileCopierApp:
             self.full_config = {}
 
         if self.directory not in self.full_config:
-            # First time seeing this project, create a default entry.
             default_primary_preset = {"selected_files": [], "filter_text": "", "exclusion_regex": self.exclusion_var.get()}
             self.full_config[self.directory] = {
                 "presets": {PRIMARY_PRESET_NAME: default_primary_preset},
@@ -267,9 +910,8 @@ class FileCopierApp:
             }
 
         self.project_data = self.full_config[self.directory]
-        self.presets = self.project_data['presets'] # Reference to the project's presets
+        self.presets = self.project_data['presets']
 
-        # Ensure primary preset exists for this project
         if PRIMARY_PRESET_NAME not in self.presets:
             self.presets[PRIMARY_PRESET_NAME] = {"selected_files": [], "filter_text": "", "exclusion_regex": self.exclusion_var.get()}
         
@@ -322,13 +964,13 @@ class FileCopierApp:
         self.presets[preset_name] = preset_data
         self.update_preset_combobox()
         self.preset_var.set(preset_name)
-        self.save_config(quiet=False) # Save immediately and give feedback
+        self.save_config(quiet=False)
         self.status_var.set(f"Preset '{preset_name}' saved and is now active.")
 
     def on_preset_selected(self, event=None):
         """Handles combobox selection, loading the new preset."""
         self.load_preset_into_ui()
-        self._debounce_auto_save() # Save the change of active preset
+        self._debounce_auto_save()
 
     def load_preset_into_ui(self):
         """Loads the files and filters from the currently selected preset in the combobox."""
@@ -337,7 +979,7 @@ class FileCopierApp:
         self.status_var.set(f"Loading preset '{preset_name}'..."); self.root.update_idletasks()
         preset_data = self.presets[preset_name]
         self.search_var.set(preset_data.get("filter_text", "")); self.exclusion_var.set(preset_data.get("exclusion_regex", ""))
-        self._perform_filter(from_preset_load=True) # Prevent double auto-save
+        self._perform_filter(from_preset_load=True)
         self.clear_all(auto_save=False)
         selected_files, files_added_count = preset_data.get("selected_files", []), 0
         for file_path in selected_files:
@@ -394,26 +1036,23 @@ class FileCopierApp:
                 if is_includable_file(full_path): self.all_text_files.append(rel_path)
         self.all_text_files.sort(key=str.lower)
         self.status_var.set(f"Ready. Found {len(self.all_text_files)} text/binary files.")
-
-    def _debounce_search(self, *args):
-        if self._search_job: self.root.after_cancel(self._search_job)
-        self._search_job = self.root.after(250, self._perform_filter)
+        
+        # Trigger continuous indexing if vector search is enabled and not already running
+        if self.vector_search_enabled and not self.is_indexing:
+            self.root.after(500, self._start_continuous_indexing)  # Small delay to let UI update
 
     def _perform_filter(self, from_preset_load: bool = False):
         search_term = self.search_var.get().lower()
         exclusion_regex = self._get_exclusion_regex()
         
-        # Check if exclusion pattern has changed - if so, we need to rescan files
         current_exclusion_pattern = self.exclusion_var.get()
         if not hasattr(self, '_last_exclusion_pattern'):
             self._last_exclusion_pattern = current_exclusion_pattern
         elif self._last_exclusion_pattern != current_exclusion_pattern:
             self._last_exclusion_pattern = current_exclusion_pattern
-            # Exclusion pattern changed, need to rescan to pick up previously excluded files
             self.status_var.set("Exclusion pattern changed, rescanning files...")
             self.root.update_idletasks()
             self._scan_and_cache_all_files()
-            # Update the exclusion_regex after rescanning
             exclusion_regex = self._get_exclusion_regex()
         
         filtered_files = [f for f in self.all_text_files if not (exclusion_regex and exclusion_regex.search(f.replace(os.path.sep, '/'))) and not (search_term and search_term not in os.path.basename(f).lower())]
@@ -542,7 +1181,7 @@ class FileCopierApp:
                 output_parts.append(formatted_block)
                 if max_preview_size: total_size += len(formatted_block)
             except Exception as e:
-                error_block = f"# ERROR: Could not read {rel_path}\n```\n{e}\n```"; output_parts.append(error_block)
+                error_block = f"# ERROR: Could not read {rel_path}\n```{e}\n```"; output_parts.append(error_block)
                 if max_preview_size: total_size += len(error_block)
         return "\n\n".join(output_parts)
 
@@ -557,6 +1196,8 @@ class FileCopierApp:
 
     def on_closing(self) -> None:
         if self._auto_save_job: self.root.after_cancel(self._auto_save_job)
+        # Stop any ongoing indexing
+        self.is_indexing = False  # ← Replace with this
         self.auto_save_current_preset(); self.root.destroy()
     def on_drag_start(self, event: tk.Event) -> None: self.drag_start_index = event.widget.nearest(event.y)
     def on_drag_motion(self, event: tk.Event) -> None:
@@ -582,7 +1223,7 @@ class FileCopierApp:
         if 'folder' in self.tree.item(item_id, 'tags') or self.tree.get_children(item_id): self.tree.item(item_id, open=False)
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="GUI to select and copy file contents.")
+    parser = argparse.ArgumentParser(description="GUI to select and copy file contents with vector search capabilities.")
     parser.add_argument("directory", nargs="?", default=".", help="The directory to scan (default: current directory).")
     args = parser.parse_args()
     if not os.path.isdir(args.directory): print(f"Error: Directory '{args.directory}' not found."); sys.exit(1)
