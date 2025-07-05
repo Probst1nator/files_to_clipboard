@@ -311,6 +311,8 @@ class FileCopierApp:
         self.tree_controls.pack(fill=tk.X, pady=(0, 5))
         self.btn_add_folder = ttk.Button(self.tree_controls, text="Add Selected Folder", command=self.add_selected_folder)
         self.btn_add_folder.pack(side=tk.LEFT)
+        self.btn_add_all = ttk.Button(self.tree_controls, text="Add All Visible", command=self.add_all_visible_files)
+        self.btn_add_all.pack(side=tk.LEFT, padx=(5, 0))
         self.btn_expand_all = ttk.Button(self.tree_controls, text="Expand All", command=self.expand_all_tree_items)
         self.btn_expand_all.pack(side=tk.LEFT, padx=(5, 0))
         self.btn_collapse_all = ttk.Button(self.tree_controls, text="Collapse All", command=self.collapse_all_tree_items)
@@ -737,6 +739,40 @@ class FileCopierApp:
         for fp in files:
             if fp not in self.selected_files_map: self.listbox.insert(tk.END, fp); self.selected_files_map[fp] = True; count += 1
         self.update_selected_count(); self.update_preview(); self._debounce_auto_save(); self.status_var.set(f"Added {count} file(s) from {os.path.basename(path)}")
+
+    def add_all_visible_files(self) -> None:
+        """Adds all file items currently visible in the tree to the selection list."""
+        visible_files = []
+        
+        def _collect_files(item_id):
+            """Recursively traverses the tree to find all file paths."""
+            for child in self.tree.get_children(item_id):
+                item_data = self.tree.item(child)
+                tags = item_data.get('tags', [])
+                # Check for either a standard file or a vector search result file
+                if 'file' in tags or (tags and tags[0].startswith('sim_')):
+                    file_path = item_data['values'][0]
+                    visible_files.append(file_path)
+                # Recurse into subdirectories, as they might be expanded
+                _collect_files(child)
+
+        # Start collection from the root of the tree ("" is the root's ID)
+        _collect_files("")
+        
+        added_count = 0
+        for file_path in visible_files:
+            if file_path not in self.selected_files_map:
+                self.listbox.insert(tk.END, file_path)
+                self.selected_files_map[file_path] = True
+                added_count += 1
+        
+        if added_count > 0:
+            self.update_selected_count()
+            self.update_preview()
+            self._debounce_auto_save()
+            self.status_var.set(f"Added {added_count} visible file(s) to selection.")
+        else:
+            self.status_var.set("All visible files were already selected.")
     def remove_selected(self) -> None:
         if self.listbox.curselection():
             idx = self.listbox.curselection()[0]; fp = self.listbox.get(idx); self.listbox.delete(idx)
