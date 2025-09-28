@@ -1,4 +1,4 @@
-# 🤖 AI Dev Paster: GUI & CLI File Manager
+# Copy Gui: A file systen interaction tooling
 
 > A powerful GUI and CLI tool to intelligently gather, format, create, and modify file contents for seamless interaction with AI assistants.
 
